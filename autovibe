@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""autovibe — a PTY wrapper that auto-answers "yes" prompts for CLI coding agents.
+
+Wraps an interactive CLI (Claude Code, Codex, Grok CLI, ...) in a pseudo
+terminal, mirrors all I/O so you can still type normally, and watches the
+output stream. When the screen settles on a known confirmation prompt
+(e.g. "❯ 1. Yes" or "(y/n)"), it sends the affirmative answer for you so
+small tasks run to completion unattended.
+
+Usage:
+    autovibe [options] -- <command> [args...]
+    autovibe -- claude
+    autovibe --max 50 --log ~/autovibe.log -- codex
+
+Only Python 3 standard library is used; works on macOS and Linux.
+"""
+
+import argparse
+import array
+import errno
+import fcntl
+import json
+import os
+import re
+import select
+import signal
+import struct
+import sys
+import termios
+import time
+import tty
+
+# ---------------------------------------------------------------------------
+# Prompt rules
+# ---------------------------------------------------------------------------
+
+# Each rule: pattern (regex, searched against the ANSI-stripped tail of
+# recent output) and send (bytes written to the child's stdin when matched).
+DEFAULT_RULES = [
+    # Numbered menu whose option 1 is an affirmative — Claude Code style:
+    #   ❯ 1. Yes
+    #     2. Yes, and don't ask again ...
+    {
+        "name": "menu-1-yes",
+        "pattern": r"(?im)^\s*(?:[❯>›]\s*)?1[.)]\s*(?:yes|y\b|同意|允许|确认|继续|approve|allow|accept|continue|proceed)",
+        "send": "1",
+    },
+    # Classic y/n confirmation at end of output: "(y/n)", "[Y/n]", "(yes/no)"
+    {
+        "name": "y-n",
+        "pattern": r"(?i)[\[(](?:y(?:es)?[/|]n(?:o)?)[\])]\s*[:：?？]?\s*$",
+        "send": "y\r",
+    },
+    # "Press enter to continue" style
+    {
+        "name": "press-enter",
+        "pattern": r"(?i)press\s+(?:enter|return)\s+to\s+(?:continue|confirm)",
+        "send": "\r",
+    },
+    # "Proceed?" / "Continue?" with a highlighted default (Codex style often
+    # just needs Enter to take the default Yes)
+    {
+        "name": "proceed-default",
+        "pattern": r"(?im)^\s*(?:[❯>›]\s*)?(?:yes|approve)\s*$",
+        "send": "\r",
+    },
+]
+
+# If the pending prompt context matches any of these, do NOT auto-answer.
+# The wrapper rings the bell and waits for a human instead.
+DEFAULT_DENY = [
+    r"(?i)rm\s+-[a-z]*r[a-z]*f",          # rm -rf and friends
+    r"(?i)git\s+push\s+.*(--force\b|-f\b)",
+    r"(?i)git\s+reset\s+--hard",
+    r"(?i)drop\s+(table|database)",
+    r"(?i)sudo\s",
+    r"(?i)don'?t\s+ask\s+again",           # never pick the "stop asking" option
+]
+
+ANSI_RE = re.compile(
+    rb"\x1b\[[0-9;?]*[ -/]*[@-~]"   # CSI sequences
+    rb"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC sequences
+    rb"|\x1b[PX^_][^\x1b]*\x1b\\"   # DCS/SOS/PM/APC
+    rb"|\x1b[@-Z\\-_]"              # other escapes
+)
+
+TAIL_LIMIT = 8000        # chars of stripped output kept for matching
+TOGGLE_KEY = b"\x1d"     # Ctrl-] toggles auto-answer on/off
+
+
+def strip_ansi(data: bytes) -> str:
+    text = ANSI_RE.sub(b"", data)
+    text = text.replace(b"\r", b"\n")
+    return text.decode("utf-8", "replace")
+
+
+def load_config(path):
+    """Merge rules/deny from a JSON config file if it exists."""
+    if not path or not os.path.exists(path):
+        return [], []
+    with open(path, "r", encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    rules = cfg.get("rules", [])
+    deny = cfg.get("deny", [])
+    return rules, deny
+
+
+class AutoVibe:
+    def __init__(self, argv, rules, deny, quiet, max_answers, cooldown,
+                 log_path, dry_run):
+        self.argv = argv
+        self.rules = [
+            {"name": r.get("name", f"rule{i}"),
+             "re": re.compile(r["pattern"]),
+             "send": r["send"].encode()}
+            for i, r in enumerate(rules)
+        ]
+        self.deny = [re.compile(p) for p in deny]
+        self.quiet = quiet
+        self.max_answers = max_answers
+        self.cooldown = cooldown
+        self.dry_run = dry_run
+        self.log_fh = open(log_path, "a", encoding="utf-8") if log_path else None
+
+        self.enabled = True
+        self.answers = 0
+        self.tail = ""
+        self.last_output = 0.0
+        self.last_answer = 0.0
+        self.denied_tail = None  # tail snapshot we already refused to answer
+
+    # -- helpers ------------------------------------------------------------
+
+    def log(self, msg):
+        line = f"[autovibe {time.strftime('%H:%M:%S')}] {msg}"
+        sys.stderr.write("\r\n" + line + "\r\n")
+        sys.stderr.flush()
+        if self.log_fh:
+            self.log_fh.write(line + "\n")
+            self.log_fh.flush()
+
+    def copy_winsize(self, master_fd):
+        if not sys.stdin.isatty():
+            return
+        buf = array.array("H", [0, 0, 0, 0])
+        fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, buf, True)
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, buf)
+
+    # -- prompt matching ----------------------------------------------------
+
+    def try_answer(self, master_fd):
+        if not self.enabled or not self.tail:
+            return
+        if self.max_answers and self.answers >= self.max_answers:
+            return
+        now = time.monotonic()
+        if now - self.last_output < self.quiet:
+            return          # output still streaming; not a settled prompt
+        if now - self.last_answer < self.cooldown:
+            return
+
+        window = self.tail[-TAIL_LIMIT:]
+        for rule in self.rules:
+            if not rule["re"].search(window):
+                continue
+            if any(d.search(window) for d in self.deny):
+                if self.denied_tail != window:
+                    self.denied_tail = window
+                    sys.stdout.write("\a")
+                    sys.stdout.flush()
+                    self.log("prompt matches a deny pattern — waiting for you "
+                             "(Ctrl-] toggles auto mode)")
+                return
+            self.answers += 1
+            self.last_answer = now
+            self.tail = ""      # consume so we don't re-fire on the same prompt
+            shown = rule["send"].decode().replace("\r", "⏎")
+            if self.dry_run:
+                self.log(f"would answer '{shown}' (rule: {rule['name']}) [dry-run]")
+            else:
+                os.write(master_fd, rule["send"])
+                self.log(f"auto-answered '{shown}' "
+                         f"(rule: {rule['name']}, #{self.answers})")
+            if self.max_answers and self.answers >= self.max_answers:
+                self.log("max answers reached — auto mode off")
+                self.enabled = False
+            return
+
+    # -- main loop ----------------------------------------------------------
+
+    def run(self):
+        pid, master_fd = os.forkpty()
+        if pid == 0:  # child
+            os.environ.setdefault("TERM", os.environ.get("TERM", "xterm-256color"))
+            try:
+                os.execvp(self.argv[0], self.argv)
+            except OSError as exc:
+                sys.stderr.write(f"autovibe: cannot exec {self.argv[0]}: {exc}\n")
+                os._exit(127)
+
+        stdin_is_tty = sys.stdin.isatty()
+        old_attrs = None
+        if stdin_is_tty:
+            old_attrs = termios.tcgetattr(sys.stdin.fileno())
+            tty.setraw(sys.stdin.fileno())
+            self.copy_winsize(master_fd)
+            signal.signal(signal.SIGWINCH,
+                          lambda *_: self.copy_winsize(master_fd))
+
+        try:
+            self._pump(master_fd)
+        finally:
+            if old_attrs is not None:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN,
+                                  old_attrs)
+            os.close(master_fd)
+            if self.log_fh:
+                self.log_fh.close()
+
+        _, status = os.waitpid(pid, 0)
+        if os.WIFEXITED(status):
+            return os.WEXITSTATUS(status)
+        if os.WIFSIGNALED(status):
+            return 128 + os.WTERMSIG(status)
+        return 1
+
+    def _pump(self, master_fd):
+        stdin_fd = sys.stdin.fileno()
+        stdin_open = True
+        while True:
+            timeout = max(0.05, self.quiet / 4)
+            fds = [master_fd, stdin_fd] if stdin_open else [master_fd]
+            try:
+                ready, _, _ = select.select(fds, [], [], timeout)
+            except InterruptedError:
+                continue
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                raise
+
+            if master_fd in ready:
+                try:
+                    data = os.read(master_fd, 65536)
+                except OSError:
+                    data = b""
+                if not data:
+                    return  # child closed its side; it has exited
+                os.write(sys.stdout.fileno(), data)
+                self.tail = (self.tail + strip_ansi(data))[-TAIL_LIMIT:]
+                self.last_output = time.monotonic()
+                self.denied_tail = None
+
+            if stdin_fd in ready:
+                try:
+                    data = os.read(stdin_fd, 65536)
+                except OSError:
+                    data = b""
+                if not data:
+                    # stdin closed (e.g. piped input finished): keep running,
+                    # the agent side is what matters.
+                    stdin_open = False
+                    continue
+                if TOGGLE_KEY in data:
+                    data = data.replace(TOGGLE_KEY, b"")
+                    self.enabled = not self.enabled
+                    self.log(f"auto mode {'ON' if self.enabled else 'OFF'}")
+                if data:
+                    os.write(master_fd, data)
+                    # A human is driving — hold off briefly so we don't fight
+                    # over the same prompt.
+                    self.last_answer = time.monotonic()
+
+            self.try_answer(master_fd)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="autovibe",
+        description="Auto-answer yes/1 to confirmation prompts of an "
+                    "interactive CLI coding agent.",
+    )
+    parser.add_argument("--quiet", type=float, default=1.0, metavar="SEC",
+                        help="output must be idle this long before a prompt "
+                             "is considered settled (default: 1.0)")
+    parser.add_argument("--cooldown", type=float, default=2.0, metavar="SEC",
+                        help="minimum gap between two auto-answers "
+                             "(default: 2.0)")
+    parser.add_argument("--max", type=int, default=0, metavar="N",
+                        help="stop auto-answering after N answers "
+                             "(0 = unlimited)")
+    parser.add_argument("--rule", action="append", default=[],
+                        metavar="REGEX=SEND",
+                        help="extra rule, tried before the built-ins; "
+                             "SEND may contain \\r for Enter (repeatable)")
+    parser.add_argument("--deny", action="append", default=[], metavar="REGEX",
+                        help="extra deny pattern: matching prompts are left "
+                             "for a human (repeatable)")
+    parser.add_argument("--config", default=os.path.expanduser(
+                            "~/.config/autovibe.json"),
+                        help="JSON config with {rules:[{pattern,send}], "
+                             "deny:[...]} (default: ~/.config/autovibe.json)")
+    parser.add_argument("--no-default-rules", action="store_true",
+                        help="use only rules from --rule/--config")
+    parser.add_argument("--no-default-deny", action="store_true",
+                        help="drop the built-in deny patterns")
+    parser.add_argument("--log", default=None, metavar="PATH",
+                        help="append auto-answer events to this file")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="log matches but never send anything")
+    parser.add_argument("command", nargs=argparse.REMAINDER,
+                        help="-- <command> [args...]")
+    args = parser.parse_args()
+
+    argv = args.command
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        parser.error("no command given; usage: autovibe [options] -- claude")
+
+    cfg_rules, cfg_deny = load_config(args.config)
+    rules = []
+    for spec in args.rule:
+        if "=" not in spec:
+            parser.error(f"--rule needs REGEX=SEND, got: {spec}")
+        pattern, send = spec.split("=", 1)
+        rules.append({"name": "cli", "pattern": pattern,
+                      "send": send.replace("\\r", "\r").replace("\\n", "\n")})
+    rules += cfg_rules
+    if not args.no_default_rules:
+        rules += DEFAULT_RULES
+
+    deny = list(args.deny) + cfg_deny
+    if not args.no_default_deny:
+        deny += DEFAULT_DENY
+
+    app = AutoVibe(argv, rules, deny, args.quiet, args.max, args.cooldown,
+                   args.log, args.dry_run)
+    sys.exit(app.run())
+
+
+if __name__ == "__main__":
+    main()
